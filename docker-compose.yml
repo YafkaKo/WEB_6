@@ -1,0 +1,33 @@
+version: '3'
+
+services:
+  db:
+    command: ['postgres', '-c', 'log_statement=all']
+    container_name: lab_5_db
+    environment:
+      - POSTGRES_DB=lab_5_db
+      - POSTGRES_USER=student
+      - POSTGRES_PASSWORD=QrGZex
+      - POSTGRES_HOST_AUTH_METHOD=trust
+    image: postgres:14
+    ports:
+      - '5432:5432'
+    restart: always
+    volumes:
+      - lab_5_db_volume:/var/lib/postgresql/data
+
+  pg_admin_lab_5:
+    container_name: pg_admin_lab_5
+    image: dpage/pgadmin4:8.9
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@example.com
+      - PGADMIN_DEFAULT_PASSWORD=qazwsxedc
+    ports:
+      - '7777:80'
+    volumes:
+      - pgadmin_volume:/var/lib/pgadmin
+    restart: always
+
+volumes:
+  pgadmin_volume:
+  lab_5_db_volume:
