@@ -1,28 +1,55 @@
-import Fastify from 'fastify'
-import { sequelize, seedDatabase } from './config/database.js'
+import Fastify from 'fastify';
+import cors from '@fastify/cors';
+import cookie from '@fastify/cookie'; // Добавлен плагин для работы с куками
+import { sequelize, seedDatabase } from './config/database.js';
 import Character from './models/laughariki.model.js';
 import User from './models/user.model.js';
 import fastifyJwt from '@fastify/jwt';
 import bcrypt from 'bcrypt';
 import { ValidationError } from 'sequelize';
 
-
 const fastify = Fastify({
-    logger: true
-})
-
-// Регистрируем JWT плагин
-fastify.register(fastifyJwt, {
-  secret: 'your-very-strong-secret-key-here-32-chars-min' // В продакшене используйте переменные окружения
+  logger: true
 });
 
-// Хелперы для работы с пользователями
+// Регистрация плагинов
+fastify.register(cors, {
+  origin: process.env.CORS_ORIGIN || true,
+  credentials: true
+});
+
+fastify.register(cookie); // Регистрация плагина для работы с куками
+
+fastify.register(fastifyJwt, {
+  secret: process.env.JWT_SECRET || 'your-very-strong-secret-key-here-32-chars-min',
+  cookie: {
+    cookieName: 'token',
+    signed: false
+  }
+});
+
+// Генерация хэша с использованием соли
+const generateHashWithSalt = async (password) => {
+  if (!password || password.length < 6) {
+    throw new Error('Пароль должен содержать минимум 6 символов');
+  }
+  const salt = await bcrypt.genSalt(10);
+  return await bcrypt.hash(password, salt);
+};
+
+// Хелпер для создания пользователя
 const createUser = async (username, password, role = 'user') => {
-  const hashedPassword = await bcrypt.hash(password, 10);
+  if (!username || !password) {
+    throw new Error('Имя пользователя и пароль обязательны');
+  }
+  const hashedPassword = await generateHashWithSalt(password);
   return User.create({ username, password: hashedPassword, role });
 };
 
+// Валидация пользователя
 const validateUser = async (username, password) => {
+  if (!username || !password) return false;
+
   const user = await User.findOne({ where: { username } });
   if (!user) return false;
 
@@ -32,98 +59,125 @@ const validateUser = async (username, password) => {
   return user;
 };
 
-// Роуты для аутентификации
-fastify.post('/api/auth/register', async (request, reply) => {
-  const { username, password } = request.body;
-
-  try {
-    const user = await createUser(username, password);
-    const token = fastify.jwt.sign({ id: user.id, role: user.role });
-    return { token };
-  } catch (error) {
-    if (error.name === 'SequelizeUniqueConstraintError') {
-      return reply.status(400).send({ error: 'Username already exists' });
-    }
-    reply.status(500).send({ error: 'Internal server error' });
-  }
-});
-
-fastify.post('/api/auth/login', async (request, reply) => {
-  const { username, password } = request.body;
-
-  const user = await validateUser(username, password);
-  if (!user) {
-    return reply.status(401).send({ error: 'Invalid credentials' });
-  }
-
-  const token = fastify.jwt.sign({ id: user.id, role: user.role });
-  return { token };
-});
-
-// Хук для проверки аутентификации
+// Декорация authenticate
 fastify.decorate('authenticate', async (request, reply) => {
   try {
     await request.jwtVerify();
   } catch (err) {
-    reply.send(err);
+    reply.clearCookie('token');
+    reply.code(401).send({ error: 'Не авторизован', message: err.message });
   }
 });
 
-// Хук для проверки роли
-fastify.decorate('verifyRole', (role) => async (request, reply) => {
+// Декорация verifyRole
+fastify.decorate('verifyRole', (requiredRole) => async (request, reply) => {
   try {
-    await request.jwtVerify();
-    if (request.user.role !== role) {
-      throw new Error('Unauthorized: Insufficient permissions');
+    const token = request.cookies.token;
+    if (!token) throw new Error('Токен отсутствует');
+
+    await request.jwtVerify(token);
+
+    if (request.user.role !== requiredRole) {
+      throw new Error('Недостаточно прав');
     }
   } catch (err) {
-    reply.code(403).send({ error: 'Forbidden', message: 'Insufficient permissions' });
+    reply.code(403).send({
+      error: 'Запрещено',
+      message: err.message
+    });
   }
 });
 
+// Схема для валидации персонажа
 const characterSchema = {
-    type: 'object',
-    required: ['name', 'avatar', 'description', 'character', 'hobbies', 'favoritePhrases', 'friends'],
-    properties: {
-      name: { type: 'string' },
-      avatar: { type: 'string', format: 'uri' },
-      description: { type: 'string' },
-      character: { type: 'string' },
-      hobbies: { type: 'string' },
-      favoritePhrases: {
-        type: 'array',
-        items: { type: 'string' },
-      },
-      friends: {
-        type: 'array',
-        items: { type: 'string' },
+  type: 'object',
+  required: ['name', 'avatar', 'description', 'character', 'hobbies', 'favoritePhrases', 'friends'],
+  properties: {
+    name: {
+      type: 'string',
+      minLength: 2,
+      maxLength: 50
+    },
+    avatar: {
+      type: 'string',
+      format: 'uri'
+    },
+    description: {
+      type: 'string',
+      minLength: 10
+    },
+    character: {
+      type: 'string',
+      minLength: 5
+    },
+    hobbies: {
+      type: 'string',
+      minLength: 5
+    },
+    favoritePhrases: {
+      type: 'array',
+      items: {
+        type: 'string',
+        minLength: 3
       },
     },
-  };
-
-  const characterPatchSchema = {
-    type: 'object',
-    properties: {
-      name: { type: 'string' },
-      avatar: { type: 'string', format: 'uri' },
-      description: { type: 'string' },
-      character: { type: 'string' },
-      hobbies: { type: 'string' },
-      favoritePhrases: {
-        type: 'array',
-        items: { type: 'string' },
-      },
-      friends: {
-        type: 'array',
-        items: { type: 'string' },
+    friends: {
+      type: 'array',
+      items: {
+        type: 'string',
+        minLength: 2
       },
     },
-  };
+  },
+};
 
-// Обработчик ошибок
+// Схема для частичной валидации персонажа
+const characterPatchSchema = {
+  type: 'object',
+  properties: {
+    name: {
+      type: 'string',
+      minLength: 2,
+      maxLength: 50
+    },
+    avatar: {
+      type: 'string',
+      format: 'uri'
+    },
+    description: {
+      type: 'string',
+      minLength: 10
+    },
+    character: {
+      type: 'string',
+      minLength: 5
+    },
+    hobbies: {
+      type: 'string',
+      minLength: 5
+    },
+    favoritePhrases: {
+      type: 'array',
+      items: {
+        type: 'string',
+        minLength: 3
+      },
+    },
+    friends: {
+      type: 'array',
+      items: {
+        type: 'string',
+        minLength: 2
+      },
+    },
+  },
+};
+
+// Обработка ошибок
 const handleError = (error, reply) => {
+  fastify.log.error(error);
+
   if (error instanceof ValidationError) {
-    // Ошибка валидации Sequelize
     return reply.status(400).send({
       error: 'Ошибка валидации',
       details: error.errors.map((err) => ({
@@ -131,19 +185,88 @@ const handleError = (error, reply) => {
         message: err.message,
       })),
     });
-  } else if (error.name === 'SequelizeDatabaseError') {
-    // Ошибка базы данных
-    return reply.status(500).send({ error: 'Ошибка базы данных', details: error.message });
-  } else if (error.name === 'SequelizeUniqueConstraintError') {
-    // Ошибка уникальности
-    return reply.status(400).send({ error: 'Нарушение уникальности', details: error.message });
-  } else {
-    // Общая ошибка сервера
-    return reply.status(500).send({ error: 'Ошибка сервера', details: error.message });
   }
+
+  const statusCode = error.statusCode || 500;
+  const message = statusCode === 500 ? 'Внутренняя ошибка сервера' : error.message;
+
+  reply.status(statusCode).send({
+    error: message,
+    details: statusCode === 500 ? undefined : error.details
+  });
 };
 
-// Защищенные роуты с JWT аутентификацией
+// Роут для регистрации
+fastify.post('/api/auth/register', async (request, reply) => {
+  const { username, password } = request.body;
+
+  try {
+    if (!username || !password) {
+      throw { statusCode: 400, message: 'Имя пользователя и пароль обязательны' };
+    }
+
+    const user = await createUser(username, password);
+    const token = fastify.jwt.sign({
+      id: user.id,
+      role: user.role
+    });
+
+    reply.setCookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 3600000,
+    });
+
+    return { message: 'Регистрация прошла успешно' };
+  } catch (error) {
+    if (error.name === 'SequelizeUniqueConstraintError') {
+      return reply.status(400).send({ error: 'Имя пользователя уже занято' });
+    }
+    handleError(error, reply);
+  }
+});
+
+
+// Роут для входа
+fastify.post('/api/auth/login', async (request, reply) => {
+  const { username, password } = request.body;
+
+  try {
+    if (!username || !password) {
+      throw { statusCode: 400, message: 'Имя пользователя и пароль обязательны' };
+    }
+
+    const user = await validateUser(username, password);
+    if (!user) {
+      throw { statusCode: 401, message: 'Неверные учетные данные' };
+    }
+
+    const token = fastify.jwt.sign({
+      id: user.id,
+      role: user.role
+    });
+
+    reply.setCookie('token', token, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      path: '/',
+      maxAge: 3600000,
+    });
+
+    return { message: 'Вы вошли успешно' };
+  } catch (error) {
+    handleError(error, reply);
+  }
+});
+
+// Роут для выхода
+fastify.post('/api/auth/logout', async (request, reply) => {
+  reply.clearCookie('token');
+  return { message: 'Вы вышли успешно' };
+});
 
 // Роут для создания персонажа (только для админов)
 fastify.post('/api/characters', {
@@ -152,30 +275,28 @@ fastify.post('/api/characters', {
   },
   preHandler: [fastify.authenticate, fastify.verifyRole('admin')]
 }, async (request, reply) => {
-  const data = request.body;
-
   try {
-    const character = await Character.create(data);
-    return reply.status(200).send(character);
+    const character = await Character.create(request.body);
+    return reply.status(201).send(character);
   } catch (error) {
     handleError(error, reply);
   }
 });
 
-// Роут для получения списка персонажей с пагинацией (доступно всем аутентифицированным пользователям)
+// Роут для получения списка персонажей с пагинацией
 fastify.get('/api/characters', {
   preHandler: fastify.authenticate
 }, async (request, reply) => {
-  const page = parseInt(request.query.page, 10) || 1;
-  const limit = parseInt(request.query.limit, 10) || 5;
-
-  if (isNaN(page) || isNaN(limit) || page < 1 || limit < 1) {
-    return reply.status(400).send({ error: 'Невалидные параметры пагинации' });
-  }
-
-  const offset = (page - 1) * limit;
-
   try {
+    const page = parseInt(request.query.page, 10) || 1;
+    const limit = parseInt(request.query.limit, 10) || 5;
+
+    if (isNaN(page) || isNaN(limit) || page < 1 || limit < 1) {
+      throw { statusCode: 400, message: 'Невалидные параметры пагинации' };
+    }
+
+    const offset = (page - 1) * limit;
+
     const { count, rows } = await Character.findAndCountAll({
       limit,
       offset,
@@ -196,102 +317,99 @@ fastify.get('/api/characters', {
   }
 });
 
+// Роут для полного обновления персонажа (PUT)
 fastify.put('/api/characters/:id', {
   schema: {
     body: characterSchema,
   },
   preHandler: [fastify.authenticate, fastify.verifyRole('admin')]
 }, async (request, reply) => {
-  const { id } = request.params;
-  const data = request.body;
-
   try {
-    const [updated] = await Character.update(data, {
+    const { id } = request.params;
+    const [updated] = await Character.update(request.body, {
       where: { id },
     });
 
     if (!updated) {
-      return reply.status(404).send({ error: 'Ресурс не найден' });
+      throw { statusCode: 404, message: 'Ресурс не найден' };
     }
 
     const updatedCharacter = await Character.findByPk(id);
-    return reply.status(200).send({
-      message: 'Данные обновлены успешно',
-      data: updatedCharacter,
-    });
+    return reply.status(200).send(updatedCharacter);
   } catch (error) {
     handleError(error, reply);
   }
 });
 
-// Роут для частичного обновления персонажа (PATCH) (только для админов)
+// Роут для частичного обновления персонажа (PATCH)
 fastify.patch('/api/characters/:id', {
   schema: {
     body: characterPatchSchema,
   },
   preHandler: [fastify.authenticate, fastify.verifyRole('admin')]
 }, async (request, reply) => {
-  const { id } = request.params;
-  const data = request.body;
-
-  if (Object.keys(data).length === 0) {
-    return reply.status(400).send({ error: 'Хотя бы одно поле должно быть заполнено' });
-  }
-
   try {
-    const [updated] = await Character.update(data, {
+    const { id } = request.params;
+
+    if (Object.keys(request.body).length === 0) {
+      throw { statusCode: 400, message: 'Необходимо указать хотя бы одно поле для обновления' };
+    }
+
+    const [updated] = await Character.update(request.body, {
       where: { id },
     });
 
     if (!updated) {
-      return reply.status(404).send({ error: 'Ресурс не найден' });
+      throw { statusCode: 404, message: 'Ресурс не найден' };
     }
 
     const updatedCharacter = await Character.findByPk(id);
-    return reply.status(200).send({
-      message: 'Данные обновлены успешно',
-      data: updatedCharacter,
-    });
+    return reply.status(200).send(updatedCharacter);
   } catch (error) {
     handleError(error, reply);
   }
 });
 
-// Роут для удаления персонажа (только для админов)
+// Роут для удаления персонажа
 fastify.delete('/api/characters/:id', {
   preHandler: [fastify.authenticate, fastify.verifyRole('admin')]
 }, async (request, reply) => {
-  const { id } = request.params;
-
   try {
+    const { id } = request.params;
     const deleted = await Character.destroy({
       where: { id },
     });
 
     if (!deleted) {
-      return reply.status(404).send({ error: 'Ресурс не найден' });
+      throw { statusCode: 404, message: 'Ресурс не найден' };
     }
 
-    return reply.status(200).send({
-      message: 'Ресурс успешно удален',
-    });
+    return reply.status(204).send();
   } catch (error) {
     handleError(error, reply);
   }
 });
 
-try {
+const startServer = async () => {
+  try {
     await sequelize.authenticate();
-    await sequelize.sync({ force: true });
+    await sequelize.sync({ force: process.env.NODE_ENV !== 'production' });
 
-    // Создаем тестового пользователя (в реальном приложении это не нужно)
     await createUser('admin', 'admin123', 'admin');
     await createUser('user', 'user123');
 
     await seedDatabase(Character);
 
-    await fastify.listen({ port: 8000 });
-} catch (err) {
+    await fastify.listen({
+      port: process.env.PORT || 8000,
+      host: '0.0.0.0'
+    });
+    
+    fastify.log.info(`Сервер запущен на ${fastify.server.address().port}`);
+  } catch (err) {
     fastify.log.error(err);
     process.exit(1);
-}
+  }
+};
+
+startServer();
