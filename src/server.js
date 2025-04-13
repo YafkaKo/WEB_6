@@ -1,24 +1,29 @@
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
-import cookie from '@fastify/cookie'; // Добавлен плагин для работы с куками
+import cookie from '@fastify/cookie';
+import fastifyJwt from '@fastify/jwt';
 import { sequelize, seedDatabase } from './config/database.js';
 import Character from './models/laughariki.model.js';
-import User from './models/user.model.js';
-import fastifyJwt from '@fastify/jwt';
-import bcrypt from 'bcrypt';
-import { ValidationError } from 'sequelize';
+import  handleError  from './utils/errorHandler.js';
+import { characterSchema, characterPatchSchema } from './validate/character.validator.js';
+import authRoutes from './controllers/auth.controller.js';
+import { createUser } from './services/user.service.js';
+import fastifyRedis from '@fastify/redis';
+import * as AuthService from './services/auth.service.js';
+import redis from './config/redis.js';
+
+
 
 const fastify = Fastify({
   logger: true
 });
 
-// Регистрация плагинов
 fastify.register(cors, {
   origin: process.env.CORS_ORIGIN || true,
   credentials: true
 });
 
-fastify.register(cookie); // Регистрация плагина для работы с куками
+fastify.register(cookie);
 
 fastify.register(fastifyJwt, {
   secret: process.env.JWT_SECRET || 'your-very-strong-secret-key-here-32-chars-min',
@@ -28,48 +33,33 @@ fastify.register(fastifyJwt, {
   }
 });
 
-// Генерация хэша с использованием соли
-const generateHashWithSalt = async (password) => {
-  if (!password || password.length < 6) {
-    throw new Error('Пароль должен содержать минимум 6 символов');
-  }
-  const salt = await bcrypt.genSalt(10);
-  return await bcrypt.hash(password, salt);
-};
+fastify.register(fastifyRedis, {
+  client: redis,
+  name: 'redis' // для доступа через app.redis
+});
 
-// Хелпер для создания пользователя
-const createUser = async (username, password, role = 'user') => {
-  if (!username || !password) {
-    throw new Error('Имя пользователя и пароль обязательны');
-  }
-  const hashedPassword = await generateHashWithSalt(password);
-  return User.create({ username, password: hashedPassword, role });
-};
+// fastify.register(fastifyRedis, { host: '127.0.0.1', password: 'qazwsxedc' })
 
-// Валидация пользователя
-const validateUser = async (username, password) => {
-  if (!username || !password) return false;
-
-  const user = await User.findOne({ where: { username } });
-  if (!user) return false;
-
-  const isValid = await bcrypt.compare(password, user.password);
-  if (!isValid) return false;
-
-  return user;
-};
-
-// Декорация authenticate
 fastify.decorate('authenticate', async (request, reply) => {
   try {
-    await request.jwtVerify();
+    const token = request.cookies.token;
+    if (!token) throw new Error('Токен отсутствует');
+
+    const decoded = await request.jwtVerify(token);
+
+    // Проверяем, есть ли токен в Redis
+    const isValid = await AuthService.isValidSession(decoded.id, token);
+    if (!isValid) {
+      throw new Error('Сессия недействительна');
+    }
+
+    request.user = decoded;
   } catch (err) {
     reply.clearCookie('token');
     reply.code(401).send({ error: 'Не авторизован', message: err.message });
   }
 });
 
-// Декорация verifyRole
 fastify.decorate('verifyRole', (requiredRole) => async (request, reply) => {
   try {
     const token = request.cookies.token;
@@ -88,187 +78,8 @@ fastify.decorate('verifyRole', (requiredRole) => async (request, reply) => {
   }
 });
 
-// Схема для валидации персонажа
-const characterSchema = {
-  type: 'object',
-  required: ['name', 'avatar', 'description', 'character', 'hobbies', 'favoritePhrases', 'friends'],
-  properties: {
-    name: {
-      type: 'string',
-      minLength: 2,
-      maxLength: 50
-    },
-    avatar: {
-      type: 'string',
-      format: 'uri'
-    },
-    description: {
-      type: 'string',
-      minLength: 10
-    },
-    character: {
-      type: 'string',
-      minLength: 5
-    },
-    hobbies: {
-      type: 'string',
-      minLength: 5
-    },
-    favoritePhrases: {
-      type: 'array',
-      items: {
-        type: 'string',
-        minLength: 3
-      },
-    },
-    friends: {
-      type: 'array',
-      items: {
-        type: 'string',
-        minLength: 2
-      },
-    },
-  },
-};
+fastify.register(authRoutes, { prefix: '/api/auth' });
 
-// Схема для частичной валидации персонажа
-const characterPatchSchema = {
-  type: 'object',
-  properties: {
-    name: {
-      type: 'string',
-      minLength: 2,
-      maxLength: 50
-    },
-    avatar: {
-      type: 'string',
-      format: 'uri'
-    },
-    description: {
-      type: 'string',
-      minLength: 10
-    },
-    character: {
-      type: 'string',
-      minLength: 5
-    },
-    hobbies: {
-      type: 'string',
-      minLength: 5
-    },
-    favoritePhrases: {
-      type: 'array',
-      items: {
-        type: 'string',
-        minLength: 3
-      },
-    },
-    friends: {
-      type: 'array',
-      items: {
-        type: 'string',
-        minLength: 2
-      },
-    },
-  },
-};
-
-// Обработка ошибок
-const handleError = (error, reply) => {
-  fastify.log.error(error);
-
-  if (error instanceof ValidationError) {
-    return reply.status(400).send({
-      error: 'Ошибка валидации',
-      details: error.errors.map((err) => ({
-        field: err.path,
-        message: err.message,
-      })),
-    });
-  }
-
-  const statusCode = error.statusCode || 500;
-  const message = statusCode === 500 ? 'Внутренняя ошибка сервера' : error.message;
-
-  reply.status(statusCode).send({
-    error: message,
-    details: statusCode === 500 ? undefined : error.details
-  });
-};
-
-// Роут для регистрации
-fastify.post('/api/auth/register', async (request, reply) => {
-  const { username, password } = request.body;
-
-  try {
-    if (!username || !password) {
-      throw { statusCode: 400, message: 'Имя пользователя и пароль обязательны' };
-    }
-
-    const user = await createUser(username, password);
-    const token = fastify.jwt.sign({
-      id: user.id,
-      role: user.role
-    });
-
-    reply.setCookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      path: '/',
-      maxAge: 3600000,
-    });
-
-    return { message: 'Регистрация прошла успешно' };
-  } catch (error) {
-    if (error.name === 'SequelizeUniqueConstraintError') {
-      return reply.status(400).send({ error: 'Имя пользователя уже занято' });
-    }
-    handleError(error, reply);
-  }
-});
-
-
-// Роут для входа
-fastify.post('/api/auth/login', async (request, reply) => {
-  const { username, password } = request.body;
-
-  try {
-    if (!username || !password) {
-      throw { statusCode: 400, message: 'Имя пользователя и пароль обязательны' };
-    }
-
-    const user = await validateUser(username, password);
-    if (!user) {
-      throw { statusCode: 401, message: 'Неверные учетные данные' };
-    }
-
-    const token = fastify.jwt.sign({
-      id: user.id,
-      role: user.role
-    });
-
-    reply.setCookie('token', token, {
-      httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'strict',
-      path: '/',
-      maxAge: 3600000,
-    });
-
-    return { message: 'Вы вошли успешно' };
-  } catch (error) {
-    handleError(error, reply);
-  }
-});
-
-// Роут для выхода
-fastify.post('/api/auth/logout', async (request, reply) => {
-  reply.clearCookie('token');
-  return { message: 'Вы вышли успешно' };
-});
-
-// Роут для создания персонажа (только для админов)
 fastify.post('/api/characters', {
   schema: {
     body: characterSchema,
@@ -283,7 +94,6 @@ fastify.post('/api/characters', {
   }
 });
 
-// Роут для получения списка персонажей с пагинацией
 fastify.get('/api/characters', {
   preHandler: fastify.authenticate
 }, async (request, reply) => {
@@ -317,7 +127,6 @@ fastify.get('/api/characters', {
   }
 });
 
-// Роут для полного обновления персонажа (PUT)
 fastify.put('/api/characters/:id', {
   schema: {
     body: characterSchema,
@@ -341,7 +150,6 @@ fastify.put('/api/characters/:id', {
   }
 });
 
-// Роут для частичного обновления персонажа (PATCH)
 fastify.patch('/api/characters/:id', {
   schema: {
     body: characterPatchSchema,
@@ -370,7 +178,6 @@ fastify.patch('/api/characters/:id', {
   }
 });
 
-// Роут для удаления персонажа
 fastify.delete('/api/characters/:id', {
   preHandler: [fastify.authenticate, fastify.verifyRole('admin')]
 }, async (request, reply) => {
@@ -400,11 +207,14 @@ const startServer = async () => {
 
     await seedDatabase(Character);
 
+    // await fastify.redis.ping();
+    //   console.log('Redis connection established');
+
     await fastify.listen({
       port: process.env.PORT || 8000,
       host: '0.0.0.0'
     });
-    
+
     fastify.log.info(`Сервер запущен на ${fastify.server.address().port}`);
   } catch (err) {
     fastify.log.error(err);
